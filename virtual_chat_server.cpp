@@ -1,59 +1,84 @@
-#include <thread>
-#include <memory>
-#include <vector>
-#include <unordered_map>
-#include <string>
 #include <algorithm>
-#include "udp_sender.hpp"
+#include <boost/bind.hpp>
+#include <memory>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 #include "udp_receiver.hpp"
+#include "udp_sender.hpp"
 
-boost::asio::io_service sendService;
-boost::asio::io_service receiveService;
-boost::asio::ip::udp::endpoint localEndpoint(boost::asio::ip::udp::v4(), 11999);
+class VirtualChatServer {
+   public:
+    VirtualChatServer(int localPort)
+        : localEndpoint(boost::asio::ip::udp::v4(), localPort),
+          udpReceiver(receiveService, localEndpoint) {}
 
-std::vector<std::unique_ptr<UDPSender>> udpSenders;
-auto udpReceiver = std::make_unique<UDPReceiver>(receiveService, localEndpoint);
+    void start() {
+        udpReceiver.async_receive(
+            boost::bind(&VirtualChatServer::handleReceive, this,
+                        boost::asio::placeholders::bytes_transferred));
 
-void handler(const boost::system::error_code& error, size_t size)
-{
-    auto it = find_if(udpSenders.begin(), udpSenders.end(), [&](const auto& udpSender)
-    {
-        return udpSender->remoteEndpoint == udpReceiver->remoteEndpoint;
-    });
+        std::thread sender([this]() {
+            boost::asio::io_service::work work(sendService);
+            sendService.run();
+        });
 
-    if (it == udpSenders.end())
-    {
-        udpSenders.emplace_back(std::make_unique<UDPSender>(sendService, localEndpoint, udpReceiver->remoteEndpoint));
+        std::thread receiver([this]() { receiveService.run(); });
+
+        while (true) {
+            std::string command;
+            std::cin >> command;
+
+            if (command == "stop") {
+                sendService.stop();
+                receiveService.stop();
+                break;
+            }
+        }
+
+        sender.join();
+        receiver.join();
     }
 
-    std::string str(udpReceiver->buffer.data(), size);
-    std::cout << str << std::endl;
+   private:
+    void handleReceive(size_t size) {
+        auto it = find_if(
+            udpSenders.begin(), udpSenders.end(), [&](const auto& udpSender) {
+                return udpSender.remoteEndpoint == udpReceiver.remoteEndpoint;
+            });
 
-    for (auto& udpSender : udpSenders)
-    {
-        udpSender->async_send([](...){}, str);
+        if (it == udpSenders.end()) {
+            udpSenders.emplace_back(sendService, localEndpoint,
+                                    udpReceiver.remoteEndpoint);
+        }
+
+        std::string str(udpReceiver.buffer.data(), size);
+        std::cout << str << std::endl;
+
+        for (auto& udpSender : udpSenders) {
+            udpSender.async_send([](...) {}, str);
+        }
+
+        udpReceiver.async_receive(
+            boost::bind(&VirtualChatServer::handleReceive, this,
+                        boost::asio::placeholders::bytes_transferred));
     }
 
-    udpReceiver->async_receive(handler);
-}
+    boost::asio::io_service sendService;
+    boost::asio::io_service receiveService;
 
-int main()
-{
-    udpReceiver->async_receive(handler);
+    boost::asio::ip::udp::endpoint localEndpoint;
 
-    std::thread sender([]() 
-    { 
-        boost::asio::io_service::work work(sendService);
-        sendService.run(); 
-    });
+    std::vector<UDPSender> udpSenders;
+    UDPReceiver udpReceiver;
+};
 
-    std::thread receiver([]() 
-    { 
-        receiveService.run();
-    });
+int main(int argc, char** argv) {
+    std::vector<std::string> args(argv, argv + argc);
 
-    sender.join();
-    receiver.join();
+    VirtualChatServer virtualChatServer(std::stoi(args[1]));
+    virtualChatServer.start();
 
     return 0;
 }
